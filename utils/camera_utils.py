@@ -9,7 +9,10 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from scene.cameras import Camera
+from tqdm import tqdm
 import numpy as np
 from utils.graphics_utils import fov2focal
 import sys
@@ -58,6 +61,11 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
 
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale))
+
+    if args.preload_img and camera_list:
+        # Decoding dominates loading, so views are decoded in parallel threads.
+        with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as executor:
+            list(tqdm(executor.map(Camera.load_view, camera_list), total=len(camera_list), desc="Preloading views"))
 
     return camera_list
 
