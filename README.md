@@ -1,3 +1,10 @@
+# Updates:
+The updates below come from [TwinAligner/pgsr](https://github.com/TwinAligner/pgsr) (commit 4b9be4d).
+
+1. Adding depth regularization to the Planar-based Gaussian Splatting Reconstruction (PGSR) framework, based on Kerbls et al. [github](https://github.com/graphdeco-inria/gaussian-splatting/tree/dev?tab=readme-ov-file#depth-regularization)
+2. Using [Depth Pro](https://github.com/apple/ml-depth-pro) as depth estimation.
+2. Adding normal regularization, genrated from depth map estimated by Depth Pro.
+
 # PGSR: Planar-based Gaussian Splatting for Efficient and High-Fidelity Surface Reconstruction
 Danpeng Chen, Hai Li, [Weicai Ye](https://ywcmaike.github.io/), Yifan Wang, Weijian Xie, Shangjin Zhai, Nan Wang, Haomin Liu, Hujun Bao, [Guofeng Zhang](http://www.cad.zju.edu.cn/home/gfzhang/)
 ### [Project Page](https://zju3dv.github.io/pgsr/) | [arXiv](https://arxiv.org/abs/2406.06521)
@@ -101,6 +108,23 @@ python scripts/run_tnt.py
 python scripts/run_mip360.py
 ```
 
+
+## Depth regularization
+
+
+Two preprocessing steps are required to enable depth regularization when training a scene:
+  To have better reconstructed scenes we use depth maps as priors during optimization with each input images. It works best on untextured parts ex: roads and can remove floaters. Several papers have used similar ideas to improve various aspects of 3DGS; (e.g. [DepthRegularizedGS](https://robot0321.github.io/DepthRegGS/index.html), [SparseGS](https://formycat.github.io/SparseGS-Real-Time-360-Sparse-View-Synthesis-using-Gaussian-Splatting/), [DNGaussian](https://fictionarry.github.io/DNGaussian/)). The depth regularization we integrated is that used in our [Hierarchical 3DGS](https://repo-sam.inria.fr/fungraph/hierarchical-3d-gaussians/) paper, but applied to the original 3DGS; for some scenes (e.g., the DeepBlending scenes) it improves quality significantly; for others it either makes a small difference or can even be worse. For details statistics please see here: [Stats for depth regularization](results.md).
+
+When training on a synthetic dataset, depth maps can be produced and they do not require further processing to be used in our method. For real world datasets please do the following: 
+1. Get depth maps for each input images, to this effect we suggest using [Depth Pro](https://github.com/apple/ml-depth-pro).
+2. Generate a `depth_params.json` file using:
+    ```
+    python utils/make_depth_scale.py --base_dir <path to colmap> --depths_dir <path to generated depths>
+    ```
+
+A new parameter should be set when training if you want to use depth regularization `-d <path to depth maps>`.
+
+
 ## Custom Dataset
 The data folder should like this:
 ```shell
@@ -137,7 +161,7 @@ python render.py -m out_path --max_depth 10.0 --voxel_size 0.01
 ```
 
 ## Acknowledgements
-This project is built upon [3DGS](https://github.com/graphdeco-inria/gaussian-splatting). Densify is based on [AbsGau](https://ty424.github.io/AbsGS.github.io/) and [GOF](https://github.com/autonomousvision/gaussian-opacity-fields?tab=readme-ov-file). DTU and Tanks and Temples dataset preprocess are based on [Neuralangelo scripts](https://github.com/NVlabs/neuralangelo/blob/main/DATA_PROCESSING.md). Evaluation scripts for DTU and Tanks and Temples dataset are based on [DTUeval-python](https://github.com/jzhangbs/DTUeval-python) and [TanksAndTemples](https://github.com/isl-org/TanksAndTemples/tree/master/python_toolbox/evaluation) respectively. We thank all the authors for their great work and repos. 
+This project is built upon [3DGS](https://github.com/graphdeco-inria/gaussian-splatting). Densify is based on [AbsGau](https://surfsplatting.github.io/) and [GOF](https://github.com/autonomousvision/gaussian-opacity-fields?tab=readme-ov-file). DTU and Tanks and Temples dataset preprocess are based on [Neuralangelo scripts](https://github.com/NVlabs/neuralangelo/blob/main/DATA_PROCESSING.md). Evaluation scripts for DTU and Tanks and Temples dataset are based on [DTUeval-python](https://github.com/jzhangbs/DTUeval-python) and [TanksAndTemples](https://github.com/isl-org/TanksAndTemples/tree/master/python_toolbox/evaluation) respectively. We thank all the authors for their great work and repos. 
 
 
 ## Citation

@@ -29,8 +29,25 @@ def erode(bin_img, ksize=12):
     out = 1 - dilate(1 - bin_img, ksize)
     return out
 
-def process_image(image_path, resolution, ncc_scale):
+def process_image(image_path, depth_path, resolution, ncc_scale):
     image = Image.open(image_path)
+    if depth_path != "":
+        try:
+            # invdepthmap = cv2.imread(depth_path, -1).astype(np.float32) / float(2**16)
+            # invdepthmap = torch.load(depth_path, weights_only=True).cpu().numpy()
+            invdepthmap = np.load(depth_path)['depth']
+        except FileNotFoundError:
+            print(f"Error: The depth file at path '{depth_path}' was not found.")
+            raise
+        except IOError:
+            print(f"Error: Unable to open the image file '{depth_path}'. It may be corrupted or an unsupported format.")
+            raise
+        except Exception as e:
+            print(f"An unexpected error occurred when trying to read depth at {depth_path}: {e}")
+            raise
+    else:
+        invdepthmap = None
+        
     if len(image.split()) > 3:
         resized_image_rgb = torch.cat([PILtoTorch(im, resolution) for im in image.split()[:3]], dim=0)
         loaded_mask = PILtoTorch(image.split()[3], resolution)
@@ -46,15 +63,18 @@ def process_image(image_path, resolution, ncc_scale):
             ncc_resolution = (int(resolution[0]/ncc_scale), int(resolution[1]/ncc_scale))
             resized_image_rgb = PILtoTorch(image, ncc_resolution)
     gray_image = (0.299 * resized_image_rgb[0] + 0.587 * resized_image_rgb[1] + 0.114 * resized_image_rgb[2])[None]
-    return gt_image, gray_image, loaded_mask
+    depth_image = cv2.resize(invdepthmap, resolution)
+    depth_image = torch.Tensor(depth_image).unsqueeze(0)
+    # depth_image = PILtoTorch(invdepthmap, resolution)
+    return gt_image, gray_image, loaded_mask, depth_image
 
 class Camera(nn.Module):
-    def __init__(self, colmap_id, R, T, FoVx, FoVy,
+    def __init__(self, colmap_id, R, T, FoVx, FoVy, depth_params,
                  image_width, image_height,
-                 image_path, image_name, uid,
+                 image_path, depth_path, image_name, uid,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, 
                  ncc_scale=1.0,
-                 preload_img=True, data_device = "cuda"
+                 preload_img=False, data_device = "cuda"
                  ):
         super(Camera, self).__init__()
         self.uid = uid
@@ -74,6 +94,7 @@ class Camera(nn.Module):
         self.Fy = fov2focal(FoVy, self.image_height)
         self.Cx = 0.5 * self.image_width
         self.Cy = 0.5 * self.image_height
+        self.depth_path = depth_path
         try:
             self.data_device = torch.device(data_device)
         except Exception as e:
@@ -84,8 +105,25 @@ class Camera(nn.Module):
         self.original_image, self.image_gray, self.mask = None, None, None
         self.preload_img = preload_img
         self.ncc_scale = ncc_scale
+        self.depth_params = depth_params
         if self.preload_img:
-            gt_image, gray_image, loaded_mask = process_image(self.image_path, self.resolution, ncc_scale)
+            gt_image, gray_image, loaded_mask, inv_depth_image = process_image(self.image_path, self.depth_path, self.resolution, ncc_scale)
+            self.invdepthmap = None
+            self.depth_reliable = False
+            if inv_depth_image is not None:
+                self.invdepthmap = inv_depth_image
+                # self.invdepthmap[self.invdepthmap < 0] = 0
+                # self.depth_reliable = True
+
+                # if depth_params is not None:
+                #     if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
+                #         self.depth_reliable = False
+                    
+                #     if depth_params["scale"] > 0:
+                #         self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
+
+                self.invdepthmap = self.invdepthmap.to(self.data_device)
+
             self.original_image = gt_image.to(self.data_device)
             self.original_image_gray = gray_image.to(self.data_device)
             self.mask = loaded_mask
@@ -105,10 +143,25 @@ class Camera(nn.Module):
 
     def get_image(self):
         if self.preload_img:
-            return self.original_image.cuda(), self.original_image_gray.cuda()
+            return self.original_image.cuda(), self.original_image_gray.cuda(), self.invdepthmap.cuda()
         else:
-            gt_image, gray_image, _ = process_image(self.image_path, self.resolution, self.ncc_scale)
-            return gt_image.cuda(), gray_image.cuda()
+            gt_image, gray_image, _, inv_depth_image = process_image(self.image_path, self.depth_path, self.resolution, self.ncc_scale)
+            if inv_depth_image is not None:
+                invdepthmap = inv_depth_image
+                # invdepthmap[invdepthmap < 0] = 0
+                # depth_reliable = True
+                # if self.depth_params is not None:
+                #     if self.depth_params["scale"] < 0.2 * self.depth_params["med_scale"] or self.depth_params["scale"] > 5 * self.depth_params["med_scale"]:
+                #         depth_reliable = False
+                    
+                #     if self.depth_params["scale"] > 0:
+                #         invdepthmap = invdepthmap * self.depth_params["scale"] + self.depth_params["offset"]
+                        
+                # if not depth_reliable:
+                #     invdepthmap = None
+                # else:
+                #     invdepthmap = invdepthmap.cuda()
+            return gt_image.cuda(), gray_image.cuda(), invdepthmap.cuda()
 
     def get_calib_matrix_nerf(self, scale=1.0):
         intrinsic_matrix = torch.tensor([[self.Fx/scale, 0, self.Cx/scale], [0, self.Fy/scale, self.Cy/scale], [0, 0, 1]]).float()

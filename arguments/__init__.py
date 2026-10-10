@@ -50,10 +50,12 @@ class ModelParams(ParamGroup):
         self._source_path = ""
         self._model_path = ""
         self._images = "images"
+        self._depths = "depths"
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
         self.eval = False
+        self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
         self.preload_img = True
         self.ncc_scale = 1.0
         self.multi_view_num = 8
@@ -90,13 +92,17 @@ class OptimizationParams(ParamGroup):
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
-        self.densify_until_iter = 15_000
+        self.densify_until_iter = 30_000
         self.densify_grad_threshold = 0.0002
         self.scale_loss_weight = 100.0
         
         self.wo_image_weight = False
         self.single_view_weight = 0.015
         self.single_view_weight_from_iter = 7000
+        
+        self.dn_weight = 0.5
+        self.dn_l1_weight_init = 0.2
+        self.dn_l1_weight_final = 0.05
 
         self.use_virtul_cam = False
         self.virtul_cam_prob = 0.5
@@ -116,6 +122,7 @@ class OptimizationParams(ParamGroup):
         self.max_all_points = 6000_000
         self.exposure_compensation = False
         self.random_background = False
+    
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

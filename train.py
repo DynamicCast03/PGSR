@@ -16,15 +16,17 @@ import random
 import numpy as np
 from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
-from utils.graphics_utils import patch_offsets, patch_warp
+from utils.graphics_utils import patch_offsets, patch_warp, normal_from_depth_image
 from gaussian_renderer import render, network_gui
 import sys, time
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import cv2
 import uuid
+import json
 from tqdm import tqdm
-from utils.image_utils import psnr, erode
+from utils.image_utils import psnr, erode, normalize, normalize_rgb, mean_filter
+from utils.general_utils import get_expon_lr_func
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
@@ -92,6 +94,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     os.system(cmd)
     cmd = f'cp -rf ./utils {dataset.model_path}/'
     os.system(cmd)
+    
+    if (args.debug_tensor != ""):
+        cmd = f'rm -r {args.debug_tensor}/*'
+        os.system(cmd)
 
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
@@ -107,6 +113,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         app_model.load_weights(scene.model_path)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+    print(bg_color)
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -117,7 +124,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_single_view_for_log = 0.0
     ema_multi_view_geo_for_log = 0.0
     ema_multi_view_pho_for_log = 0.0
-    normal_loss, geo_loss, ncc_loss = None, None, None
+    ema_multi_view_depth_for_log = 0.0
+    normal_loss, geo_loss, ncc_loss, depth_loss = None, None, None, None
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     debug_path = os.path.join(scene.model_path, "debug")
@@ -138,6 +146,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         #             break
         #     except Exception as e:
         #         network_gui.conn = None
+        
+        debug_tensor = {}
+        debug_loss = {}
 
         iter_start.record()
         gaussians.update_learning_rate(iteration)
@@ -149,8 +160,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
-        gt_image, gt_image_gray = viewpoint_cam.get_image()
+        # import ipdb; ipdb.set_trace()
+        gt_image, gt_image_gray, invdepthmap = viewpoint_cam.get_image()
         if iteration > 1000 and opt.exposure_compensation:
             gaussians.use_app = True
 
@@ -163,6 +174,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             return_plane=iteration>opt.single_view_weight_from_iter, return_depth_normal=iteration>opt.single_view_weight_from_iter)
         image, viewspace_point_tensor, visibility_filter, radii = \
             render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
+        debug_tensor["render"] = image
         
         # Loss
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -194,6 +207,54 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             else:
                 normal_loss = weight * (((depth_normal - normal)).abs().sum(0)).mean()
             loss += (normal_loss)
+            
+            debug_tensor["rendered_normal"] = normal
+            debug_tensor["depth_normal"] = depth_normal
+            
+        # dn_l1_weight = opt.dn_weight
+        dn_l1_weight = get_expon_lr_func(opt.dn_l1_weight_init, opt.dn_l1_weight_final, max_steps=opt.iterations)(iteration)
+        # import ipdb; ipdb.set_trace()
+        if iteration > opt.single_view_weight_from_iter and invdepthmap is not None and dn_l1_weight > 0:
+            depth_weight = dn_l1_weight# * 30
+            normal_weight = dn_l1_weight
+            
+            depth_metric = invdepthmap.cuda()
+                        
+            # LSimDepth = (1.0 - ssim(depth, mono_invdepth))
+            # loss += weight * (0.5 * LSimDepth + 0.5 * Ll1depth_pure)
+            
+            # Normal-loss
+            # intrinsic_matrix, extrinsic_matrix = viewpoint_cam.get_calib_matrix_nerf(scale=1.0)
+            # depth_normal_gt = normal_from_depth_image(depth_metric.squeeze(), intrinsic_matrix.cuda(), extrinsic_matrix.cuda()).permute(2, 0, 1)            
+            
+            # rendered_normal = render_pkg["rendered_normal"]
+            # normal_loss_rendered = (((rendered_normal - depth_normal_gt)).abs().sum(0)).mean()
+            # # normal_loss_rendered = 1.0 - ssim(rendered_normal, depth_normal_gt)
+            
+            # depth_normal = render_pkg["depth_normal"]
+            # normal_loss_depth = (((depth_normal - depth_normal_gt)).abs().sum(0)).mean()
+            # normal_loss_depth = 1.0 - ssim(depth_normal, depth_normal_gt)
+            
+            
+            # loss += normal_weight * (normal_loss_rendered + normal_loss_depth)
+            # debug_loss["normal_loss"] = normal_loss.item()
+            # debug_tensor["normal"] = depth_normal_gt
+            
+            # # Depth-loss
+            depth = render_pkg["plane_depth"]
+            min_non_zero = depth[depth != 0].min()
+            depth[depth == 0] = min_non_zero
+            depth = normalize(depth)
+            depth_metric_norm = normalize(depth_metric)
+            depth_loss = depth_weight * l1_loss(depth, depth_metric_norm)
+            loss += depth_loss
+                
+            debug_loss["depth_loss"] = depth_loss.item()
+            
+            # debug_tensor["plane_depth"] = depth
+            # debug_tensor["depth_metric"] = depth_metric_norm
+            
+                
 
         # multi-view loss
         if iteration > opt.multi_view_weight_from_iter:
@@ -315,7 +376,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
                         grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
                         grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-                        _, nearest_image_gray = nearest_cam.get_image()
+                        _, nearest_image_gray, _ = nearest_cam.get_image()
                         sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
                         sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
                         
@@ -329,6 +390,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             ncc_loss = ncc_weight * ncc.mean()
                             loss += ncc_loss
 
+        # save debug tensors
+        if ((len(args.debug_tensor) > 0) and (iteration % 100 == 0)):
+            debug_tensor_path = args.debug_tensor
+            if not os.path.exists(debug_tensor_path):
+                raise FileNotFoundError(f"cannot found path: '{debug_tensor_path}'")
+            for key in debug_tensor.keys():
+                try:
+                    torch.save(debug_tensor[key], os.path.join(debug_tensor_path, key + ".pt"))
+                except KeyError:
+                    pass
+            with open(os.path.join(args.debug_tensor, "loss.json"), "w") as file:
+                json.dump(debug_loss, file, indent=4, ensure_ascii=False)
+            
+            
+            
         loss.backward()
         iter_end.record()
 
@@ -338,12 +414,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_single_view_for_log = 0.4 * normal_loss.item() if normal_loss is not None else 0.0 + 0.6 * ema_single_view_for_log
             ema_multi_view_geo_for_log = 0.4 * geo_loss.item() if geo_loss is not None else 0.0 + 0.6 * ema_multi_view_geo_for_log
             ema_multi_view_pho_for_log = 0.4 * ncc_loss.item() if ncc_loss is not None else 0.0 + 0.6 * ema_multi_view_pho_for_log
+            ema_multi_view_depth_for_log = 0.4 * depth_loss.item() if depth_loss is not None else 0.0 + 0.6 * ema_multi_view_depth_for_log
             if iteration % 10 == 0:
                 loss_dict = {
                     "Loss": f"{ema_loss_for_log:.{5}f}",
                     "Single": f"{ema_single_view_for_log:.{5}f}",
                     "Geo": f"{ema_multi_view_geo_for_log:.{5}f}",
                     "Pho": f"{ema_multi_view_pho_for_log:.{5}f}",
+                    "Depth": f"{ema_multi_view_depth_for_log:.{5}f}",
                     "Points": f"{len(gaussians.get_xyz)}"
                 }
                 progress_bar.set_postfix(loss_dict)
@@ -447,7 +525,7 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
                     if 'app_image' in out:
                         image = out['app_image']
                     image = torch.clamp(image, 0.0, 1.0)
-                    gt_image, _ = viewpoint.get_image()
+                    gt_image, _, _ = viewpoint.get_image()
                     gt_image = torch.clamp(gt_image.to("cuda"), 0.0, 1.0)
                     if tb_writer and (idx < 5):
                         tb_writer.add_images(config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
@@ -476,6 +554,7 @@ if __name__ == "__main__":
     pp = PipelineParams(parser)
     parser.add_argument('--ip', type=str, default="127.0.0.1")
     parser.add_argument('--port', type=int, default=6007)
+    parser.add_argument('--debug_tensor', type=str, default="")
     parser.add_argument('--debug_from', type=int, default=-100)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])

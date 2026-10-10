@@ -39,7 +39,7 @@ def clean_mesh(mesh, min_len=1000):
     mesh_0.remove_triangles_by_mask(triangles_to_remove)
     return mesh_0
 
-def post_process_mesh(mesh, cluster_to_keep=1):
+def post_process_mesh(mesh, cluster_to_keep=5):
     """
     Post-process a mesh to filter out floaters and disconnected parts
     """
@@ -53,7 +53,8 @@ def post_process_mesh(mesh, cluster_to_keep=1):
     cluster_n_triangles = np.asarray(cluster_n_triangles)
     cluster_area = np.asarray(cluster_area)
     n_cluster = np.sort(cluster_n_triangles.copy())[-cluster_to_keep]
-    n_cluster = max(n_cluster, 50) # filter meshes smaller than 50
+    # n_cluster = max(n_cluster, 50) # filter meshes smaller than 50
+    # n_cluster = 50
     triangles_to_remove = cluster_n_triangles[triangle_clusters] < n_cluster
     mesh_0.remove_triangles_by_mask(triangles_to_remove)
     mesh_0.remove_unreferenced_vertices()
@@ -76,7 +77,7 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
 
     depths_tsdf_fusion = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        gt, _ = view.get_image()
+        gt, _, _ = view.get_image()
         out = render(view, gaussians, pipeline, background, app_model=app_model)
         rendering = out["render"].clamp(0.0, 1.0)
         _, H, W = rendering.shape
@@ -135,10 +136,10 @@ def render_set(model_path, name, iteration, views, scene, gaussians, pipeline, b
                 pose)
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool,
-                 max_depth : float, voxel_size : float, num_cluster: int, use_depth_filter : bool):
+                 max_depth : float, voxel_size : float, num_cluster: int, use_depth_filter : bool, load_ply_path: str):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+        scene = Scene(dataset, gaussians, load_iteration=iteration, load_ply_path=load_ply_path, shuffle=False)
         # app_model = AppModel()
         # app_model.load_weights(scene.model_path)
         # app_model.eval()
@@ -160,11 +161,16 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             path = os.path.join(dataset.model_path, "mesh")
             os.makedirs(path, exist_ok=True)
             
-            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion.ply"), mesh, 
+            target_file_fusion = os.path.join(path, "tsdf_fusion.ply")
+            target_file_fusion_post = os.path.join(path, "tsdf_fusion_post.ply")
+            if len(load_ply_path) > 0:
+                target_file_fusion = load_ply_path.replace(".ply", "_tsdf_fusion.ply")
+                target_file_fusion_post = load_ply_path.replace(".ply", "_tsdf_fusion_post.ply")
+            o3d.io.write_triangle_mesh(target_file_fusion, mesh, 
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
             
             mesh = post_process_mesh(mesh, num_cluster)
-            o3d.io.write_triangle_mesh(os.path.join(path, "tsdf_fusion_post.ply"), mesh, 
+            o3d.io.write_triangle_mesh(target_file_fusion_post, mesh, 
                                        write_triangle_uvs=True, write_vertex_colors=True, write_vertex_normals=True)
 
         if not skip_test:
@@ -180,10 +186,11 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--max_depth", default=5.0, type=float)
-    parser.add_argument("--voxel_size", default=0.002, type=float)
+    parser.add_argument("--max_depth", default=50.0, type=float)
+    parser.add_argument("--voxel_size", default=0.1, type=float)
     parser.add_argument("--num_cluster", default=1, type=int)
     parser.add_argument("--use_depth_filter", action="store_true")
+    parser.add_argument("--load_ply_path", type=str, default="")
 
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
@@ -191,4 +198,4 @@ if __name__ == "__main__":
     # Initialize system state (RNG)
     safe_state(args.quiet)
     print(f"multi_view_num {model.multi_view_num}")
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.max_depth, args.voxel_size, args.num_cluster, args.use_depth_filter)
+    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test, args.max_depth, args.voxel_size, args.num_cluster, args.use_depth_filter, args.load_ply_path)
