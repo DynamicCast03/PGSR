@@ -177,7 +177,15 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist = torch.sqrt(torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001))
+        dist_input = fused_point_cloud.contiguous()
+        try:
+            dist = torch.sqrt(torch.clamp_min(distCUDA2(dist_input), 0.0000001))
+        except (RuntimeError, MemoryError) as e:
+            # Dense input point clouds can fail on a fragmented cache; retry once.
+            print(f"[WARN] distCUDA2 failed once with: {e}")
+            print("[WARN] Clearing CUDA cache and retrying distCUDA2")
+            torch.cuda.empty_cache()
+            dist = torch.sqrt(torch.clamp_min(distCUDA2(dist_input), 0.0000001))
         # print(f"new scale {torch.quantile(dist, 0.1)}")
         scales = torch.log(dist)[...,None].repeat(1, 3)
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
@@ -195,6 +203,7 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.max_weight = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        torch.cuda.empty_cache()
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
