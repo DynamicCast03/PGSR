@@ -14,7 +14,6 @@ from datetime import datetime
 import torch
 import random
 import numpy as np
-from random import randint
 from utils.loss_utils import l1_loss, ssim, lncc, get_img_grad_weight
 from utils.graphics_utils import patch_offsets, patch_warp, normal_from_depth_image
 from gaussian_renderer import render, network_gui
@@ -31,6 +30,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from scene.app_model import AppModel
 from scene.cameras import Camera
+from utils.camera_utils import ViewPrefetcher
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -120,6 +120,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
+    prefetcher = ViewPrefetcher() if dataset.stream_views else None
     ema_loss_for_log = 0.0
     ema_single_view_for_log = 0.0
     ema_multi_view_geo_for_log = 0.0
@@ -157,11 +158,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        # Views are visited in a shuffled order, so the next ones are known to the prefetcher.
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            random.shuffle(viewpoint_stack)
+        viewpoint_cam = viewpoint_stack.pop()
         # import ipdb; ipdb.set_trace()
-        gt_image, gt_image_gray, invdepthmap = viewpoint_cam.get_image()
+        if prefetcher is None:
+            gt_image, gt_image_gray, invdepthmap = viewpoint_cam.get_image()
+        else:
+            gt_image, gt_image_gray, invdepthmap = prefetcher.get_image(viewpoint_cam)
+            prefetcher.schedule(reversed(viewpoint_stack[-prefetcher.window:]))
         if iteration > 1000 and opt.exposure_compensation:
             gaussians.use_app = True
 
@@ -264,6 +271,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 nearest_cam = gen_virtul_cam(viewpoint_cam, trans_noise=dataset.multi_view_max_dis, deg_noise=dataset.multi_view_max_angle)
                 use_virtul_cam = True
             if nearest_cam is not None:
+                if prefetcher is not None and not use_virtul_cam:
+                    prefetcher.prefetch(nearest_cam)
                 patch_size = opt.multi_view_patch_size
                 sample_num = opt.multi_view_sample_num
                 pixel_noise_th = opt.multi_view_pixel_noise_th
@@ -376,7 +385,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         grid = patch_warp(H_ref_to_neareast.reshape(-1,3,3), ori_pixels_patch)
                         grid[:, :, 0] = 2 * grid[:, :, 0] / (W - 1) - 1.0
                         grid[:, :, 1] = 2 * grid[:, :, 1] / (H - 1) - 1.0
-                        _, nearest_image_gray, _ = nearest_cam.get_image()
+                        if prefetcher is None:
+                            _, nearest_image_gray, _ = nearest_cam.get_image()
+                        else:
+                            _, nearest_image_gray, _ = prefetcher.get_image(nearest_cam)
                         sampled_gray_val = F.grid_sample(nearest_image_gray[None], grid.reshape(1, -1, 1, 2), align_corners=True)
                         sampled_gray_val = sampled_gray_val.reshape(-1, total_patch_size)
                         
@@ -478,6 +490,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 app_model.save_weights(scene.model_path, iteration)
     
     app_model.save_weights(scene.model_path, opt.iterations)
+    if prefetcher is not None:
+        prefetcher.close()
     torch.cuda.empty_cache()
 
 def prepare_output_and_logger(args):    

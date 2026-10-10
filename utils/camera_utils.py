@@ -52,7 +52,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                   image_width=resolution[0], image_height=resolution[1],
                   image_path=cam_info.image_path, depth_path=cam_info.depth_path,
                   image_name=cam_info.image_name, uid=cam_info.global_id, 
-                  preload_img=args.preload_img, 
+                  preload_img=args.preload_img and not args.stream_views,
                   ncc_scale=args.ncc_scale,
                   data_device=args.data_device)
 
@@ -62,12 +62,47 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     for id, c in enumerate(cam_infos):
         camera_list.append(loadCam(args, id, c, resolution_scale))
 
-    if args.preload_img and camera_list:
+    if args.preload_img and not args.stream_views and camera_list:
         # Decoding dominates loading, so views are decoded in parallel threads.
         with ThreadPoolExecutor(max_workers=min(16, os.cpu_count() or 1)) as executor:
             list(tqdm(executor.map(Camera.load_view, camera_list), total=len(camera_list), desc="Preloading views"))
 
     return camera_list
+
+class ViewPrefetcher:
+    """Decode upcoming training views in background threads.
+
+    Only the scheduled views and the views added by prefetch are decoded or held on
+    the host, so memory does not grow with the number of views.
+    """
+
+    def __init__(self, workers=8, window=16):
+        self.executor = ThreadPoolExecutor(max_workers=workers)
+        self.window = window
+        self.futures = {}
+
+    def schedule(self, cameras):
+        """Decode the first window cameras, the next views to be used, and drop all others."""
+        cameras = list(cameras)[:self.window]
+        keep = {id(camera) for camera in cameras}
+        for key in [key for key in self.futures if key not in keep]:
+            self.futures.pop(key).cancel()
+        for camera in cameras:
+            self.prefetch(camera)
+
+    def prefetch(self, camera):
+        """Start decoding camera unless it is already pending."""
+        if id(camera) not in self.futures:
+            self.futures[id(camera)] = self.executor.submit(camera.decode)
+
+    def get_image(self, camera):
+        """Return the images of camera on the GPU, as Camera.get_image does."""
+        future = self.futures.pop(id(camera), None)
+        view = camera.decode() if future is None else future.result()
+        return camera.get_image(view)
+
+    def close(self):
+        self.executor.shutdown(wait=True, cancel_futures=True)
 
 def camera_to_JSON(id, camera : Camera):
     Rt = np.zeros((4, 4))

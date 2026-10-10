@@ -161,8 +161,12 @@ class Camera(nn.Module):
         self.camera_center = self.world_view_transform.inverse()[3, :3]
         self.plane_mask, self.non_plane_mask = None, None
 
-    def load_view(self):
-        """Decode this view once and keep it on data_device for get_image."""
+    def decode(self):
+        """Decode this view on the host as (rgb, mask, ncc_gray, invdepthmap, depth_reliable).
+
+        rgb is (3, H, W) uint8 and invdepthmap the (1, H, W) depth with depth_params
+        applied. The camera is not modified, so views can be decoded in worker threads.
+        """
         rgb, mask, ncc_gray, inv_depth_image = decode_view(self.image_path, self.depth_path, self.resolution, self.ncc_scale)
         invdepthmap = None
         depth_reliable = False
@@ -175,23 +179,36 @@ class Camera(nn.Module):
                     depth_reliable = False
                 if self.depth_params["scale"] > 0:
                     invdepthmap = invdepthmap * self.depth_params["scale"] + self.depth_params["offset"]
-            invdepthmap = invdepthmap.to(self.data_device)
+        return rgb, mask, ncc_gray, invdepthmap, depth_reliable
+
+    def load_view(self):
+        """Decode this view once and keep it on data_device for get_image."""
+        rgb, mask, ncc_gray, invdepthmap, depth_reliable = self.decode()
         self.rgb_uint8 = rgb.to(self.data_device)
         self.ncc_gray = None if ncc_gray is None else ncc_gray.to(self.data_device)
         self.mask = mask
-        self.invdepthmap = invdepthmap
+        self.invdepthmap = None if invdepthmap is None else invdepthmap.to(self.data_device)
         self.depth_reliable = depth_reliable
 
-    def get_image(self):
-        if self.preload_img:
-            if self.rgb_uint8 is None:
-                self.load_view()
-            gt_image = self.rgb_uint8.cuda() / 255.0
-            if self.ncc_gray is None:
+    def get_image(self, view=None):
+        """Return the RGB, gray and depth images on the GPU.
+
+        view is a result of decode(); without it the preloaded view is used, or
+        the view is decoded here when views are not preloaded.
+        """
+        if view is not None or self.preload_img:
+            if view is None:
+                if self.rgb_uint8 is None:
+                    self.load_view()
+                rgb, ncc_gray, invdepthmap = self.rgb_uint8, self.ncc_gray, self.invdepthmap
+            else:
+                rgb, _, ncc_gray, invdepthmap, _ = view
+            gt_image = rgb.cuda() / 255.0
+            if ncc_gray is None:
                 gray_image = (0.299 * gt_image[0] + 0.587 * gt_image[1] + 0.114 * gt_image[2])[None]
             else:
-                gray_image = self.ncc_gray.cuda()
-            invdepthmap = None if self.invdepthmap is None else self.invdepthmap.cuda()
+                gray_image = ncc_gray.cuda()
+            invdepthmap = None if invdepthmap is None else invdepthmap.cuda()
             return gt_image, gray_image, invdepthmap
         else:
             gt_image, gray_image, _, inv_depth_image = process_image(self.image_path, self.depth_path, self.resolution, self.ncc_scale)

@@ -57,6 +57,9 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.render_items = ['RGB', 'Alpha', 'Normal', 'Depth', 'Edge', 'Curvature']
         self.preload_img = True
+        # Decode views on demand in background threads instead of preloading
+        # them, for captures whose views do not fit in memory.
+        self.stream_views = False
         self.ncc_scale = 1.0
         self.multi_view_num = 8
         self.multi_view_max_angle = 30
