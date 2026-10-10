@@ -122,7 +122,16 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.npz") if depths_folder != "" else ""
+        if depths_folder != "":
+            depth_base = os.path.join(depths_folder, extr.name[:-n_remove])
+            if os.path.exists(f"{depth_base}.png"):
+                depth_path = f"{depth_base}.png"
+            elif os.path.exists(f"{depth_base}.npz"):
+                depth_path = f"{depth_base}.npz"
+            else:
+                depth_path = f"{depth_base}.npz"
+        else:
+            depth_path = ""
 
         cam_info = CameraInfo(uid=uid, global_id=idx, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
@@ -168,7 +177,7 @@ def readColmapSceneInfo(path, images, depths, eval, llffhold=8):
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
     
-    depth_params_file = os.path.join(path, "sparse", "0", "depth_params.json")
+    depth_params_file = os.path.join(path, "sparse", "depth_params.json")
     ## if depth_params_file isnt there AND depths file is here -> throw error
     depths_params = None
     if depths != "":
@@ -221,7 +230,7 @@ def readColmapSceneInfo(path, images, depths, eval, llffhold=8):
     ply_path = os.path.join(path, "sparse/points3D.ply")
     bin_path = os.path.join(path, "sparse/points3D.bin")
     txt_path = os.path.join(path, "sparse/points3D.txt")
-    if not os.path.exists(ply_path) or True:
+    if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)

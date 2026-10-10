@@ -33,9 +33,13 @@ def process_image(image_path, depth_path, resolution, ncc_scale):
     image = Image.open(image_path)
     if depth_path != "":
         try:
-            # invdepthmap = cv2.imread(depth_path, -1).astype(np.float32) / float(2**16)
-            # invdepthmap = torch.load(depth_path, weights_only=True).cpu().numpy()
-            invdepthmap = np.load(depth_path)['depth']
+            if depth_path.endswith('.npz'):
+                invdepthmap = np.load(depth_path)['depth']
+            elif depth_path.endswith('.png'):
+                depth_mm = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+                invdepthmap = depth_mm / 1000.0
+            else:
+                raise ValueError(f"Unsupported depth format: {depth_path}")
         except FileNotFoundError:
             print(f"Error: The depth file at path '{depth_path}' was not found.")
             raise
@@ -112,15 +116,15 @@ class Camera(nn.Module):
             self.depth_reliable = False
             if inv_depth_image is not None:
                 self.invdepthmap = inv_depth_image
-                # self.invdepthmap[self.invdepthmap < 0] = 0
-                # self.depth_reliable = True
+                self.invdepthmap[self.invdepthmap < 0] = 0
+                self.depth_reliable = True
 
-                # if depth_params is not None:
-                #     if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
-                #         self.depth_reliable = False
-                    
-                #     if depth_params["scale"] > 0:
-                #         self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
+                if depth_params is not None:
+                    if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
+                        self.depth_reliable = False
+
+                    if depth_params["scale"] > 0:
+                        self.invdepthmap = self.invdepthmap * depth_params["scale"] + depth_params["offset"]
 
                 self.invdepthmap = self.invdepthmap.to(self.data_device)
 
@@ -161,7 +165,7 @@ class Camera(nn.Module):
                 #     invdepthmap = None
                 # else:
                 #     invdepthmap = invdepthmap.cuda()
-            return gt_image.cuda(), gray_image.cuda(), invdepthmap.cuda()
+            return gt_image.cuda(), gray_image.cuda(), invdepthmap
 
     def get_calib_matrix_nerf(self, scale=1.0):
         intrinsic_matrix = torch.tensor([[self.Fx/scale, 0, self.Cx/scale], [0, self.Fy/scale, self.Cy/scale], [0, 0, 1]]).float()
