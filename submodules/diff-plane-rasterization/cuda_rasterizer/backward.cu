@@ -395,6 +395,14 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
+// Sum a value over the 32 lanes of a warp; the result is valid in lane 0.
+__device__ __forceinline__ float warpSum(float value)
+{
+	for (int offset = 16; offset > 0; offset /= 2)
+		value += __shfl_down_sync(0xffffffff, value, offset);
+	return value;
+}
+
 // Backward version of the rendering procedure.
 template <uint32_t C,uint32_t MAP_N>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
@@ -516,99 +524,152 @@ renderCUDA(
 		}
 		block.sync();
 
-		// Iterate over Gaussians
-		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		// Iterate over Gaussians. All threads of the block take every step, so
+		// that the 32 pixels of a warp handle the same Gaussian together: their
+		// gradients are summed within the warp and added by one atomic per value.
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
 		{
 			// Keep track of current Gaussian ID. Skip, if this one
 			// is behind the last contributor for this pixel.
-			contributor--;
-			if (contributor >= last_contributor)
-				continue;
+			bool valid = !done;
+			if (valid)
+			{
+				contributor--;
+				valid = contributor < last_contributor;
+			}
 
 			// Compute blending values, as before.
-			const float2 xy = collected_xy[j];
-			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
 			const float4 con_o = collected_conic_opacity[j];
-			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
-			if (power > 0.0f)
+			float2 d = { 0.0f, 0.0f };
+			float G = 0.0f;
+			float alpha = 0.0f;
+			if (valid)
+			{
+				const float2 xy = collected_xy[j];
+				d = { xy.x - pixf.x, xy.y - pixf.y };
+				const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+				valid = !(power > 0.0f);
+				if (valid)
+				{
+					G = exp(power);
+					alpha = min(0.99f, con_o.w * G);
+					valid = !(alpha < 1.0f / 255.0f);
+				}
+			}
+			if (__ballot_sync(0xffffffff, valid) == 0)
 				continue;
 
-			const float G = exp(power);
-			const float alpha = min(0.99f, con_o.w * G);
-			if (alpha < 1.0f / 255.0f)
-				continue;
+			// Per-pixel gradients of this Gaussian; zero for skipping pixels.
+			float dL_dcolor_pix[C] = { 0 };
+			float dL_dall_map_pix[MAP_N] = { 0 };
+			float dL_dmean_x = 0.0f, dL_dmean_y = 0.0f;
+			float dL_dmean_abs_x = 0.0f, dL_dmean_abs_y = 0.0f;
+			float dL_dconic_x = 0.0f, dL_dconic_y = 0.0f, dL_dconic_w = 0.0f;
+			float dL_dopacity_pix = 0.0f;
+			if (valid)
+			{
+				T = T / (1.f - alpha);
+				const float dchannel_dcolor = alpha * T;
 
-			T = T / (1.f - alpha);
-			const float dchannel_dcolor = alpha * T;
+				// Propagate gradients to per-Gaussian colors and keep
+				// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+				// pair).
+				float dL_dalpha = 0.0f;
+				for (int ch = 0; ch < C; ch++)
+				{
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
 
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-			float dL_dalpha = 0.0f;
+					const float dL_dchannel = dL_dpixel[ch];
+					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+					dL_dcolor_pix[ch] = dchannel_dcolor * dL_dchannel;
+				}
+				if (render_geo) {
+					for (int ch = 0; ch < MAP_N; ch++)
+					{
+						const float c = collected_all_maps[ch * BLOCK_SIZE + j];
+						// Update last color (to be used in the next iteration)
+						accum_all_map[ch] = last_alpha * last_all_map[ch] + (1.f - last_alpha) * accum_all_map[ch];
+						last_all_map[ch] = c;
+
+						const float dL_dchannel = dL_dout_all_map[ch];
+						dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
+						dL_dall_map_pix[ch] = dchannel_dcolor * dL_dchannel;
+					}
+				}
+
+				dL_dalpha *= T;
+				// Update last alpha (to be used in the next iteration)
+				last_alpha = alpha;
+
+				// Account for fact that alpha also influences how much of
+				// the background color is added if nothing left to blend
+				float bg_dot_dpixel = 0;
+				for (int i = 0; i < C; i++)
+					bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+				dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+				// Helpful reusable temporary variables
+				const float dL_dG = con_o.w * dL_dalpha;
+				const float gdx = G * d.x;
+				const float gdy = G * d.y;
+				const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+				const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+				// Gradients w.r.t. 2D mean position of the Gaussian
+				dL_dmean_x = dL_dG * dG_ddelx * ddelx_dx;
+				dL_dmean_y = dL_dG * dG_ddely * ddely_dy;
+				dL_dmean_abs_x = fabs(dL_dmean_x);
+				dL_dmean_abs_y = fabs(dL_dmean_y);
+
+				// Gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+				dL_dconic_x = -0.5f * gdx * d.x * dL_dG;
+				dL_dconic_y = -0.5f * gdx * d.y * dL_dG;
+				dL_dconic_w = -0.5f * gdy * d.y * dL_dG;
+
+				// Gradients w.r.t. opacity of the Gaussian
+				dL_dopacity_pix = G * dL_dalpha;
+			}
+
+			// Sum over the warp; lane 0 adds the totals for this Gaussian.
 			const int global_id = collected_id[j];
+			const bool leader = (block.thread_rank() & 31) == 0;
 			for (int ch = 0; ch < C; ch++)
 			{
-				const float c = collected_colors[ch * BLOCK_SIZE + j];
-				// Update last color (to be used in the next iteration)
-				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
-				last_color[ch] = c;
-
-				const float dL_dchannel = dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
+				const float sum = warpSum(dL_dcolor_pix[ch]);
+				if (leader)
+					atomicAdd(&(dL_dcolors[global_id * C + ch]), sum);
 			}
 			if (render_geo) {
 				for (int ch = 0; ch < MAP_N; ch++)
 				{
-					const float c = collected_all_maps[ch * BLOCK_SIZE + j];
-					// Update last color (to be used in the next iteration)
-					accum_all_map[ch] = last_alpha * last_all_map[ch] + (1.f - last_alpha) * accum_all_map[ch];
-					last_all_map[ch] = c;
-
-					const float dL_dchannel = dL_dout_all_map[ch];
-					dL_dalpha += (c - accum_all_map[ch]) * dL_dchannel;
-					// Update the gradients w.r.t. color of the Gaussian. 
-					// Atomic, since this pixel is just one of potentially
-					// many that were affected by this Gaussian.
-					atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), dchannel_dcolor * dL_dchannel);
+					const float sum = warpSum(dL_dall_map_pix[ch]);
+					if (leader)
+						atomicAdd(&(dL_dall_map[global_id * MAP_N + ch]), sum);
 				}
 			}
-			
-			dL_dalpha *= T;
-			// Update last alpha (to be used in the next iteration)
-			last_alpha = alpha;
-
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < C; i++)
-				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
-			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
-
-
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
-			atomicAdd(&dL_dmean2D_abs[global_id].x, fabs(dL_dG * dG_ddelx * ddelx_dx));
-			atomicAdd(&dL_dmean2D_abs[global_id].y, fabs(dL_dG * dG_ddely * ddely_dy));
-
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
-
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha);
+			dL_dmean_x = warpSum(dL_dmean_x);
+			dL_dmean_y = warpSum(dL_dmean_y);
+			dL_dmean_abs_x = warpSum(dL_dmean_abs_x);
+			dL_dmean_abs_y = warpSum(dL_dmean_abs_y);
+			dL_dconic_x = warpSum(dL_dconic_x);
+			dL_dconic_y = warpSum(dL_dconic_y);
+			dL_dconic_w = warpSum(dL_dconic_w);
+			dL_dopacity_pix = warpSum(dL_dopacity_pix);
+			if (leader)
+			{
+				atomicAdd(&dL_dmean2D[global_id].x, dL_dmean_x);
+				atomicAdd(&dL_dmean2D[global_id].y, dL_dmean_y);
+				atomicAdd(&dL_dmean2D_abs[global_id].x, dL_dmean_abs_x);
+				atomicAdd(&dL_dmean2D_abs[global_id].y, dL_dmean_abs_y);
+				atomicAdd(&dL_dconic2D[global_id].x, dL_dconic_x);
+				atomicAdd(&dL_dconic2D[global_id].y, dL_dconic_y);
+				atomicAdd(&dL_dconic2D[global_id].w, dL_dconic_w);
+				atomicAdd(&(dL_dopacity[global_id]), dL_dopacity_pix);
+			}
 		}
 	}
 }
