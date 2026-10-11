@@ -237,7 +237,7 @@ class Camera(nn.Module):
     def get_rays(self, scale=1.0):
         W, H = int(self.image_width/scale), int(self.image_height/scale)
         ix, iy = torch.meshgrid(
-            torch.arange(W), torch.arange(H), indexing='xy')
+            torch.arange(W, device='cuda'), torch.arange(H, device='cuda'), indexing='xy')
         rays_d = torch.stack(
                     [(ix-self.Cx/scale) / self.Fx * scale,
                     (iy-self.Cy/scale) / self.Fy * scale,

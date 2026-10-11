@@ -281,9 +281,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 geo_weight = opt.multi_view_geo_weight
                 ## compute geometry consistency mask and loss
                 H, W = render_pkg['plane_depth'].squeeze().shape
+                device = render_pkg['plane_depth'].device
                 ix, iy = torch.meshgrid(
-                    torch.arange(W), torch.arange(H), indexing='xy')
-                pixels = torch.stack([ix, iy], dim=-1).float().to(render_pkg['plane_depth'].device)
+                    torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
+                pixels = torch.stack([ix, iy], dim=-1).float()
 
                 nearest_render_pkg = render(nearest_cam, gaussians, pipe, bg, app_model=app_model,
                                             return_plane=True, return_depth_normal=False)
@@ -345,7 +346,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                             d_mask = d_mask.reshape(-1)
                             valid_indices = torch.arange(d_mask.shape[0], device=d_mask.device)[d_mask]
                             if d_mask.sum() > sample_num:
-                                index = np.random.choice(d_mask.sum().cpu().numpy(), sample_num, replace = False)
+                                index = torch.randperm(int(d_mask.sum()), device=d_mask.device)[:sample_num]
                                 valid_indices = valid_indices[index]
 
                             weights = weights.reshape(-1)[valid_indices]
